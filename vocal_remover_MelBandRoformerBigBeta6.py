@@ -10,17 +10,8 @@ Colab-скрипт: удаление вокала Mel-Band Roformer Big Beta 6 +
   5. Вставь прямую ссылку на скачивание исходного аудиофайла
   6. В конце получишь ссылку на минус, действующую 7 дней
 """
-import os, sys
+import subprocess, os, glob, sys, zipfile, re
 from urllib.parse import urlparse
-
-if len(sys.argv) != 2:
-    sys.exit("Запусти скрипт из Colab-ячейки через launcher: ссылка передаётся вторым аргументом.")
-TRACK_URL = sys.argv[1].strip()
-parsed_url = urlparse(TRACK_URL)
-if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
-    sys.exit("❌ Нужна полноценная ссылка, начинающаяся с http:// или https://")
-
-import subprocess, glob, zipfile, re, shutil, shlex
 from urllib.request import Request, urlopen
 import yaml as _yaml
 
@@ -48,6 +39,15 @@ print("=" * 60)
 print("\n[1/8] Установка пакетов...")
 run("pip install -q -U melband-roformer-infer soundfile")
 
+# 2. Запрашиваем и скачиваем трек
+print("\n[2/8] Скачивание трека...")
+while True:
+    TRACK_URL = input("Вставь прямую ссылку на скачивание трека (mp3/wav/flac/m4a или ZIP): ").strip()
+    parsed_url = urlparse(TRACK_URL)
+    if parsed_url.scheme in ("http", "https") and parsed_url.netloc:
+        break
+    print("❌ Нужна полноценная ссылка, начинающаяся с http:// или https://")
+
 try:
     request = Request(TRACK_URL, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(request, timeout=120) as response, open("input_track", "wb") as output:
@@ -62,42 +62,22 @@ except Exception as error:
 assert os.path.getsize("input_track") > 1000, "Трек не скачался или файл слишком маленький"
 print(f"   ✓ Скачано: {os.path.getsize('input_track') // 1024} KB")
 
-# Если это ZIP — распаковываем все аудиофайлы, иначе обрабатываем один трек
+# Если это ZIP — распаковываем, иначе берём как есть
 if zipfile.is_zipfile("input_track"):
-    shutil.rmtree("input_extracted", ignore_errors=True)
     with zipfile.ZipFile("input_track") as z:
         z.extractall("input_extracted")
-    audio_files = sorted(
-        m for m in glob.glob("input_extracted/**/*", recursive=True)
-        if os.path.isfile(m) and m.lower().endswith((".mp3", ".wav", ".flac", ".m4a"))
-    )
+    mp3s = glob.glob("input_extracted/**/*", recursive=True)
+    mp3s = [m for m in mp3s if m.lower().endswith((".mp3", ".wav", ".flac", ".m4a"))]
 else:
-    audio_files = ["input_track"]
-assert audio_files, "В архиве нет аудиофайлов"
-print(f"   Найдено треков: {len(audio_files)}")
+    mp3s = ["input_track"]
+assert mp3s, "В архиве нет аудио"
+run(f"cp '{mp3s[0]}' track_source")
+print(f"   Найден файл: {mp3s[0]}")
 
-# 3. Конвертация всех треков в WAV 44.1kHz стерео
-print("\n[3/8] Конвертация всех треков в WAV...")
-shutil.rmtree("input_wav", ignore_errors=True)
+# 3. Конвертация в WAV 44.1kHz стерео
+print("\n[3/8] Конвертация в WAV...")
 os.makedirs("input_wav", exist_ok=True)
-input_wavs = []
-used_names = set()
-for index, source in enumerate(audio_files, 1):
-    original_name = os.path.splitext(os.path.basename(source))[0]
-    safe_name = re.sub(r"[^A-Za-z0-9А-Яа-я._-]+", "_", original_name).strip("._") or f"track_{index}"
-    candidate = safe_name
-    suffix = 2
-    while candidate.lower() in used_names:
-        candidate = f"{safe_name}_{suffix}"
-        suffix += 1
-    used_names.add(candidate.lower())
-    target = os.path.join("input_wav", f"{candidate}.wav")
-    print(f"   [{index}/{len(audio_files)}] {os.path.basename(source)}")
-    run(
-        f"ffmpeg -y -i {shlex.quote(source)} -ar 44100 -ac 2 "
-        f"{shlex.quote(target)} -loglevel error"
-    )
-    input_wavs.append(target)
+run("ffmpeg -y -i track_source -ar 44100 -ac 2 input_wav/track.wav -loglevel error")
 
 # 4. Скачиваем модель
 print(f"\n[4/8] Скачивание модели {MODEL}...")
@@ -130,45 +110,24 @@ with open(cfg, "w") as f:
 print(f"   Конфиг нормализован → {cfg}\n   Веса:   {weights}")
 
 # 6. Инференс на GPU
-print("\n[6/8] Разделение всех треков (Big Beta 6 на GPU)...")
-shutil.rmtree("out", ignore_errors=True)
+print("\n[6/8] Разделение (Big Beta 6 на GPU)...")
 run(
     f"melband-roformer-infer "
     f"--config_path '{cfg}' --model_path '{weights}' "
     f"--input_folder input_wav --store_dir out --device cuda:0"
 )
 
-# 7. Конвертация всех инструменталов в MP3 320 kbps и упаковка в ZIP
-print("\n[7/8] Конвертация всех инструменталов в MP3 320 kbps...")
-inst = sorted(glob.glob("out/*_instrumental.wav"))
+# 7. Конвертация инструментала в MP3 320 kbps
+print("\n[7/8] Конвертация в MP3 320 kbps...")
+inst = glob.glob("out/*_instrumental.wav")
 assert inst, "❌ instrumental.wav не найден в выводе"
-if len(inst) != len(input_wavs):
-    print(f"⚠️ Модель вернула {len(inst)} инструменталов из {len(input_wavs)} треков")
-shutil.rmtree("no_vocals", ignore_errors=True)
-os.makedirs("no_vocals", exist_ok=True)
-mp3_outputs = []
-for index, wav_file in enumerate(inst, 1):
-    stem = os.path.basename(wav_file)
-    if stem.lower().endswith("_instrumental.wav"):
-        stem = stem[:-len("_instrumental.wav")]
-    output_file = os.path.join("no_vocals", f"{stem}_instrumental.mp3")
-    run(
-        f"ffmpeg -y -i {shlex.quote(wav_file)} -c:a libmp3lame "
-        f"-b:a {OUTPUT_BITRATE} -ar 44100 {shlex.quote(output_file)} -loglevel error"
-    )
-    mp3_outputs.append(output_file)
-    print(f"   ✓ [{index}/{len(inst)}] {os.path.basename(output_file)} ({os.path.getsize(output_file) // 1024} KB)")
+run(f"ffmpeg -y -i '{inst[0]}' -c:a libmp3lame -b:a {OUTPUT_BITRATE} -ar 44100 no_vocals.mp3 -loglevel error")
+print(f"   ✓ no_vocals.mp3 ({os.path.getsize('no_vocals.mp3') // 1024} KB)")
 
-archive_name = "no_vocals.zip"
-with zipfile.ZipFile(archive_name, "w", zipfile.ZIP_DEFLATED) as archive:
-    for output_file in mp3_outputs:
-        archive.write(output_file, os.path.basename(output_file))
-print(f"   ✓ Архив создан: {archive_name} ({os.path.getsize(archive_name) // 1024} KB)")
-
-# 8. Загрузка архива на tempshare
-print("\n[8/8] Загрузка архива на tempshare...")
+# 8. Загрузка на tempshare
+print("\n[8/8] Загрузка на tempshare...")
 r = subprocess.run(
-    f'curl -s -X POST -F "file=@{shlex.quote(archive_name)}" -F "duration={TEMPSHARE_DURATION}" '
+    f'curl -s -X POST -F "file=@no_vocals.mp3" -F "duration={TEMPSHARE_DURATION}" '
     f"https://api.tempshare.su/upload",
     shell=True, capture_output=True, text=True,
 )
